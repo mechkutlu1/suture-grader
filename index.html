@@ -1,0 +1,690 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Suture Grader — capture, time, score, explain</title>
+<meta name="description" content="Capture a start and final suture photo, time the attempt, score it with a CNN, and see a SHAP-style heatmap of where the suture succeeds or fails." />
+
+<!-- TensorFlow.js: loaded in the end user's browser from CDN (fine on GitHub Pages). -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tensorflow/4.20.0/tf.min.js" defer></script>
+
+<style>
+  /* ---- Design tokens ---------------------------------------------------
+     Subject: surgical suture assessment. Clinical, measured, instrument-like.
+     Ink petrol + surgical-drape green, coral for the "unsuccessful" signal,
+     suture-thread gold as the single accent. Mono readouts = surgical stopwatch. */
+  :root{
+    --ink:#0E2A28;
+    --ink-soft:#254945;
+    --surface:#EEF1EC;
+    --panel:#FBFCFA;
+    --line:#D3DAD2;
+    --teal:#1B6B5E;
+    --teal-deep:#12564B;
+    --good:#2E9E6B;
+    --good-tint:#DCEFE3;
+    --bad:#D9634B;
+    --bad-tint:#F6E0D9;
+    --gold:#C9A227;
+    --muted:#6E827D;
+    --shadow:0 1px 0 rgba(14,42,40,.04), 0 12px 30px -18px rgba(14,42,40,.4);
+    --r:14px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --ink:#EAF1EC; --ink-soft:#B9CBC5; --surface:#0C1817; --panel:#122120;
+      --line:#20302E; --teal:#4FBBA6; --teal-deep:#3EA791; --muted:#8AA09A;
+      --good:#54C08A; --good-tint:#122A21; --bad:#E8836E; --bad-tint:#2A1712;
+      --shadow:0 12px 30px -18px rgba(0,0,0,.7);
+    }
+  }
+
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:var(--surface);
+    color:var(--ink);
+    font-family:"Inter",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+    padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  .wrap{max-width:520px;margin:0 auto;padding:20px 16px 64px}
+
+  /* ---- Header ---- */
+  header{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:6px}
+  .brand{display:flex;align-items:center;gap:10px}
+  .stitch{width:34px;height:34px;flex:none}
+  h1{
+    font-family:"Space Grotesk",Inter,sans-serif;
+    font-size:20px;font-weight:600;letter-spacing:-.01em;margin:0;
+  }
+  .sub{color:var(--muted);font-size:12.5px;margin:2px 0 20px;max-width:44ch}
+
+  /* ---- Stepper ---- */
+  .steps{display:flex;gap:6px;margin-bottom:18px}
+  .step{
+    flex:1;padding:8px 10px;border:1px solid var(--line);border-radius:10px;
+    background:var(--panel);font-size:11px;color:var(--muted);
+    display:flex;align-items:center;gap:8px;transition:.25s;
+  }
+  .step b{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px}
+  .step.on{border-color:var(--teal);color:var(--teal);background:var(--panel)}
+  .step.done{color:var(--good);border-color:var(--good)}
+  .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}
+
+  /* ---- Cards ---- */
+  .card{
+    background:var(--panel);border:1px solid var(--line);border-radius:var(--r);
+    padding:16px;margin-bottom:14px;box-shadow:var(--shadow);
+  }
+  .card h2{
+    font-family:"Space Grotesk",Inter,sans-serif;font-size:13px;font-weight:600;
+    letter-spacing:.02em;text-transform:uppercase;color:var(--ink-soft);margin:0 0 12px;
+    display:flex;align-items:center;gap:8px;
+  }
+  .card h2 .idx{font-family:"IBM Plex Mono",monospace;color:var(--gold);font-size:12px}
+
+  /* ---- Timer ---- */
+  .timer{
+    display:flex;align-items:center;justify-content:space-between;gap:14px;
+  }
+  .clock{
+    font-family:"IBM Plex Mono",ui-monospace,monospace;
+    font-size:44px;font-weight:600;letter-spacing:-.02em;line-height:1;
+    font-variant-numeric:tabular-nums;
+  }
+  .clock small{font-size:18px;color:var(--muted)}
+  .timer-btns{display:flex;flex-direction:column;gap:8px}
+
+  button{
+    font-family:inherit;font-size:14px;font-weight:500;cursor:pointer;
+    border-radius:10px;border:1px solid var(--line);background:var(--panel);
+    color:var(--ink);padding:11px 14px;transition:.15s;
+  }
+  button:hover{border-color:var(--teal)}
+  button:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  .btn-primary{background:var(--teal);border-color:var(--teal);color:#fff}
+  .btn-primary:hover{background:var(--teal-deep);border-color:var(--teal-deep)}
+  .btn-ghost{background:transparent}
+  .btn-row{display:flex;gap:10px;flex-wrap:wrap}
+  .btn-row button{flex:1;min-width:120px}
+  .btn-sm{padding:8px 12px;font-size:12.5px}
+
+  /* ---- Capture slots ---- */
+  .slots{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .slot{
+    border:1.5px dashed var(--line);border-radius:12px;background:var(--panel);
+    aspect-ratio:1/1;position:relative;overflow:hidden;display:flex;
+    align-items:center;justify-content:center;text-align:center;
+  }
+  .slot.filled{border-style:solid;border-color:var(--teal)}
+  .slot img{width:100%;height:100%;object-fit:cover;display:block}
+  .slot .placeholder{color:var(--muted);font-size:12px;padding:10px}
+  .slot .placeholder svg{width:26px;height:26px;margin-bottom:6px;opacity:.7}
+  .slot .tag{
+    position:absolute;top:8px;left:8px;background:rgba(14,42,40,.82);color:#fff;
+    font-family:"IBM Plex Mono",monospace;font-size:10px;padding:3px 7px;border-radius:6px;
+    letter-spacing:.04em;
+  }
+  .slot .retake{
+    position:absolute;bottom:8px;right:8px;background:rgba(251,252,250,.92);
+    color:var(--ink);border:1px solid var(--line);font-size:11px;padding:5px 9px;
+    border-radius:8px;
+  }
+  @media (prefers-color-scheme: dark){ .slot .retake{background:rgba(18,33,32,.92)} }
+
+  /* ---- Result ---- */
+  #result{display:none}
+  .verdict{
+    display:flex;align-items:center;gap:14px;padding:14px;border-radius:12px;margin-bottom:14px;
+  }
+  .verdict.good{background:var(--good-tint)}
+  .verdict.bad{background:var(--bad-tint)}
+  .gauge{width:82px;height:82px;flex:none}
+  .verdict .label{font-family:"Space Grotesk",Inter,sans-serif;font-size:19px;font-weight:600}
+  .verdict .conf{font-size:12.5px;color:var(--ink-soft);font-family:"IBM Plex Mono",monospace}
+
+  .heat-head{display:flex;align-items:center;justify-content:space-between;margin:2px 0 10px}
+  .heat-head .t{font-size:12.5px;color:var(--ink-soft);font-weight:500}
+  .toggle{display:flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+  .toggle button{border:none;border-radius:0;padding:7px 12px;font-size:11.5px;background:var(--panel);color:var(--muted)}
+  .toggle button.on{background:var(--teal);color:#fff}
+
+  .heat-stage{position:relative;border-radius:12px;overflow:hidden;border:1px solid var(--line);background:#000}
+  .heat-stage canvas{width:100%;display:block}
+  #heatOverlay{position:absolute;inset:0;transition:opacity .2s}
+
+  .scale{display:flex;align-items:center;gap:10px;margin-top:10px;font-family:"IBM Plex Mono",monospace;font-size:10.5px;color:var(--muted)}
+  .scale .bar{flex:1;height:8px;border-radius:5px;background:linear-gradient(90deg,var(--bad),#eee 50%,var(--good))}
+  @media (prefers-color-scheme: dark){ .scale .bar{background:linear-gradient(90deg,var(--bad),#2a3a38 50%,var(--good))} }
+
+  .metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px}
+  .metric{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--panel)}
+  .metric .k{font-size:11px;color:var(--muted)}
+  .metric .v{font-family:"IBM Plex Mono",monospace;font-size:17px;font-weight:600;margin-top:2px}
+  .metric .track{height:5px;border-radius:4px;background:var(--line);margin-top:7px;overflow:hidden}
+  .metric .fill{height:100%;background:var(--teal);border-radius:4px}
+
+  .duration-note{margin-top:12px;font-size:12px;color:var(--muted);display:flex;gap:6px;align-items:center}
+  .duration-note b{font-family:"IBM Plex Mono",monospace;color:var(--ink)}
+
+  /* ---- Model settings ---- */
+  details.model{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);padding:0;margin-bottom:14px;overflow:hidden}
+  details.model summary{
+    list-style:none;cursor:pointer;padding:14px 16px;font-size:12.5px;color:var(--ink-soft);
+    display:flex;align-items:center;justify-content:space-between;font-weight:500;
+  }
+  details.model summary::-webkit-details-marker{display:none}
+  details.model .body{padding:0 16px 16px;font-size:12.5px;color:var(--muted)}
+  details.model input[type=text]{
+    width:100%;padding:10px;border:1px solid var(--line);border-radius:9px;background:var(--surface);
+    color:var(--ink);font-family:"IBM Plex Mono",monospace;font-size:12px;margin:8px 0;
+  }
+  .chev{transition:.2s}
+  details[open] .chev{transform:rotate(180deg)}
+  .pill{font-family:"IBM Plex Mono",monospace;font-size:10.5px;padding:3px 8px;border-radius:20px;border:1px solid var(--line);color:var(--muted)}
+  #modelState{color:var(--teal);border-color:var(--teal)}
+
+  footer{margin-top:26px;text-align:center;color:var(--muted);font-size:11px;line-height:1.7}
+  footer code{font-family:"IBM Plex Mono",monospace;font-size:10.5px;background:var(--panel);padding:1px 5px;border-radius:5px;border:1px solid var(--line)}
+  a{color:var(--teal)}
+
+  .busy{display:inline-block;width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--teal);border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:6px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @media (prefers-reduced-motion: reduce){ *{animation-duration:.001ms!important;transition:none!important} }
+
+  .hidden-file{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="brand">
+      <svg class="stitch" viewBox="0 0 40 40" fill="none" aria-hidden="true">
+        <line x1="4" y1="20" x2="36" y2="20" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="2 3"/>
+        <g stroke="var(--teal)" stroke-width="2.4" stroke-linecap="round">
+          <path d="M10 11 L16 29"/><path d="M16 11 L10 29"/>
+          <path d="M24 11 L30 29"/><path d="M30 11 L24 29"/>
+        </g>
+      </svg>
+      <div>
+        <h1>Suture Grader</h1>
+      </div>
+    </div>
+  </header>
+  <p class="sub">Time an attempt, capture the start and final stitch, then score it with a CNN and read a heatmap of where the suture holds or fails.</p>
+
+  <!-- Stepper -->
+  <div class="steps" id="stepper">
+    <div class="step on" data-step="prep"><span class="dot"></span><b>01</b> Prep</div>
+    <div class="step" data-step="suture"><span class="dot"></span><b>02</b> Suture</div>
+    <div class="step" data-step="grade"><span class="dot"></span><b>03</b> Grade</div>
+  </div>
+
+  <!-- Timer -->
+  <div class="card">
+    <h2><span class="idx">01</span> Attempt timer</h2>
+    <div class="timer">
+      <div class="clock" id="clock">00:00<small>.0</small></div>
+      <div class="timer-btns">
+        <button class="btn-primary btn-sm" id="startTimer">Start</button>
+        <button class="btn-ghost btn-sm" id="resetTimer">Reset</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Capture -->
+  <div class="card">
+    <h2><span class="idx">02</span> Capture stitches</h2>
+    <div class="slots">
+      <div class="slot" id="slotStart" data-which="start">
+        <div class="placeholder">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.4"/></svg>
+          <div>Start photo</div>
+        </div>
+      </div>
+      <div class="slot" id="slotFinal" data-which="final">
+        <div class="placeholder">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.4"/></svg>
+          <div>Final photo</div>
+        </div>
+      </div>
+    </div>
+    <input class="hidden-file" type="file" id="fileStart" accept="image/*" capture="environment">
+    <input class="hidden-file" type="file" id="fileFinal" accept="image/*" capture="environment">
+    <div class="btn-row" style="margin-top:12px">
+      <button class="btn-primary" id="gradeBtn" disabled>Grade suture</button>
+    </div>
+  </div>
+
+  <!-- Model settings -->
+  <details class="model">
+    <summary>
+      <span>Scoring model <span class="pill" id="modelState">geometry analyzer</span></span>
+      <svg class="chev" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="var(--muted)" stroke-width="1.6"><path d="M4 6l4 4 4-4"/></svg>
+    </summary>
+    <div class="body">
+      <p>By default the app scores with an on-device suture-geometry analyzer — no download, works offline. To run your own trained network from the papers, convert your Keras model with <code>tensorflowjs_converter</code> and host the folder (e.g. on GitHub Pages), then paste the <code>model.json</code> URL:</p>
+      <input type="text" id="modelUrl" placeholder="https://your-user.github.io/suture-model/model.json" spellcheck="false">
+      <div class="btn-row">
+        <button class="btn-sm" id="loadModel">Load model</button>
+        <button class="btn-sm btn-ghost" id="unloadModel">Use analyzer</button>
+      </div>
+      <p style="margin-top:10px" id="modelMsg"></p>
+    </div>
+  </details>
+
+  <!-- Result -->
+  <div class="card" id="result">
+    <h2><span class="idx">03</span> Assessment</h2>
+
+    <div class="verdict" id="verdict">
+      <svg class="gauge" id="gauge" viewBox="0 0 100 100" aria-hidden="true"></svg>
+      <div>
+        <div class="label" id="verdictLabel">—</div>
+        <div class="conf" id="verdictConf"></div>
+      </div>
+    </div>
+
+    <div class="heat-head">
+      <span class="t">Explanation — final stitch</span>
+      <div class="toggle" id="viewToggle">
+        <button data-view="heat" class="on">Heatmap</button>
+        <button data-view="raw">Photo</button>
+      </div>
+    </div>
+    <div class="heat-stage">
+      <canvas id="baseCanvas"></canvas>
+      <canvas id="heatOverlay"></canvas>
+    </div>
+    <div class="scale">
+      <span>hurts</span><div class="bar"></div><span>helps</span>
+    </div>
+    <p style="font-size:11.5px;color:var(--muted);margin:8px 0 0">Red regions push the score toward <b style="color:var(--bad)">unsuccessful</b>; blue regions push toward <b style="color:var(--good)">successful</b> — measured by occluding each region and reading how the score moves (SHAP-style attribution).</p>
+
+    <div class="metrics" id="metrics"></div>
+
+    <div class="duration-note" id="durationNote"></div>
+  </div>
+
+  <footer>
+    Runs fully in the browser — nothing is uploaded. Static app for GitHub Pages: drop <code>index.html</code> in a repo and enable Pages.<br>
+    Scoring is an educational aid, not a clinical assessment.
+  </footer>
+</div>
+
+<script>
+/* ============================================================================
+   Suture Grader — static, browser-only.
+   Pipeline mirrors the two papers:
+     • capture start + final photo, time the attempt
+     • score final stitch (CNN if a TF.js model is loaded, else geometry analyzer)
+     • occlusion-based attribution → SHAP-style red/blue heatmap
+   ========================================================================== */
+
+const $ = (id) => document.getElementById(id);
+const GRID = 224;           // model / analysis input size (matches papers' 224x224)
+const OCC = 14;             // occlusion grid for the heatmap (14x14 patches)
+
+const state = {
+  startImg: null, finalImg: null,      // ImageBitmap/HTMLImageElement
+  timer: { running:false, t0:0, elapsed:0, raf:0, attemptMs:0 },
+  model: null, modelMode:'analyzer',   // 'analyzer' | 'cnn'
+  modelInput: null,                    // [h,w] auto-detected from loaded model
+  lastScore: null,
+};
+
+/* ---------- Timer ---------------------------------------------------------- */
+function fmt(ms){
+  const s = ms/1000;
+  const m = Math.floor(s/60);
+  const sec = Math.floor(s%60);
+  const tenth = Math.floor((ms%1000)/100);
+  return `${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}<small>.${tenth}</small>`;
+}
+function tick(){
+  state.timer.elapsed = performance.now() - state.timer.t0;
+  $('clock').innerHTML = fmt(state.timer.elapsed);
+  state.timer.raf = requestAnimationFrame(tick);
+}
+$('startTimer').addEventListener('click', () => {
+  const t = state.timer;
+  if(t.running){
+    cancelAnimationFrame(t.raf);
+    t.running = false;
+    t.attemptMs = t.elapsed;
+    $('startTimer').textContent = 'Start';
+    setStep('suture');
+  } else {
+    t.t0 = performance.now() - t.elapsed;
+    t.running = true;
+    $('startTimer').textContent = 'Stop';
+    $('startTimer').classList.remove('btn-primary');
+    tick();
+  }
+});
+$('resetTimer').addEventListener('click', () => {
+  const t = state.timer;
+  cancelAnimationFrame(t.raf);
+  t.running=false; t.elapsed=0; t.attemptMs=0;
+  $('clock').innerHTML = fmt(0);
+  $('startTimer').textContent='Start';
+  $('startTimer').classList.add('btn-primary');
+});
+
+/* ---------- Stepper -------------------------------------------------------- */
+function setStep(name){
+  const order = ['prep','suture','grade'];
+  const at = order.indexOf(name);
+  document.querySelectorAll('.step').forEach(el=>{
+    const i = order.indexOf(el.dataset.step);
+    el.classList.toggle('on', i===at);
+    el.classList.toggle('done', i<at);
+  });
+}
+
+/* ---------- Capture -------------------------------------------------------- */
+function wireSlot(which){
+  const slot = $(which==='start'?'slotStart':'slotFinal');
+  const file = $(which==='start'?'fileStart':'fileFinal');
+  slot.addEventListener('click', (e)=>{ if(!e.target.classList.contains('retake')) file.click(); });
+  file.addEventListener('change', async ()=>{
+    if(!file.files || !file.files[0]) return;
+    const url = URL.createObjectURL(file.files[0]);
+    const img = new Image();
+    img.onload = ()=>{
+      if(which==='start') state.startImg = img; else state.finalImg = img;
+      renderSlot(which, url);
+      maybeEnableGrade();
+    };
+    img.src = url;
+  });
+}
+function renderSlot(which, url){
+  const slot = $(which==='start'?'slotStart':'slotFinal');
+  slot.classList.add('filled');
+  slot.innerHTML = `<span class="tag">${which==='start'?'START':'FINAL'}</span>
+    <img src="${url}" alt="${which} suture">
+    <button class="retake">Retake</button>`;
+  slot.querySelector('.retake').addEventListener('click',(e)=>{
+    e.stopPropagation();
+    $(which==='start'?'fileStart':'fileFinal').click();
+  });
+}
+function maybeEnableGrade(){
+  $('gradeBtn').disabled = !state.finalImg;   // final is required; start is optional context
+}
+wireSlot('start'); wireSlot('final');
+
+/* ---------- Image → tensor-ish sampling ------------------------------------ */
+function toCanvas(img, size){
+  const c = document.createElement('canvas');
+  c.width=size; c.height=size;
+  const ctx = c.getContext('2d', { willReadFrequently:true });
+  // cover-fit crop to square
+  const s = Math.min(img.width, img.height);
+  const sx=(img.width-s)/2, sy=(img.height-s)/2;
+  ctx.drawImage(img, sx, sy, s, s, 0, 0, size, size);
+  return c;
+}
+
+/* ============================================================================
+   SCORING — two interchangeable backends returning a suture-success prob 0..1.
+   Both expose scoreCanvas(canvas) so the occlusion heatmap reuses either one.
+   ========================================================================== */
+
+/* --- Backend A: on-device suture-geometry analyzer (default, offline) ------
+   Measures the properties a grader actually looks for and the papers describe:
+   thread detection, wound axis, stitch spacing regularity, cross-axis symmetry,
+   and stitch-angle consistency. Returns prob + interpretable sub-metrics. */
+function analyze(canvas){
+  const ctx = canvas.getContext('2d',{willReadFrequently:true});
+  const {width:W, height:H} = canvas;
+  const d = ctx.getImageData(0,0,W,H).data;
+
+  // luminance + dark-thread mask (Otsu-ish adaptive threshold)
+  const lum = new Float32Array(W*H);
+  let mean=0;
+  for(let i=0;i<W*H;i++){
+    const r=d[i*4],g=d[i*4+1],b=d[i*4+2];
+    const l=0.299*r+0.587*g+0.114*b; lum[i]=l; mean+=l;
+  }
+  mean/=W*H;
+  let varsum=0; for(let i=0;i<W*H;i++){const dv=lum[i]-mean;varsum+=dv*dv;}
+  const std=Math.sqrt(varsum/(W*H));
+  const thr=mean-0.55*std;                       // thread is darker than local mean
+  const pts=[];
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){ if(lum[y*W+x]<thr) pts.push([x,y]); }
+  const coverage=pts.length/(W*H);
+
+  if(pts.length<40){ // essentially no thread found
+    return {prob:0.12, metrics:{regularity:0.1,symmetry:0.1,alignment:0.1,coverage:coverage}};
+  }
+
+  // wound axis via PCA of dark points
+  let mx=0,my=0; for(const [x,y] of pts){mx+=x;my+=y;} mx/=pts.length;my/=pts.length;
+  let sxx=0,syy=0,sxy=0;
+  for(const [x,y] of pts){const dx=x-mx,dy=y-my;sxx+=dx*dx;syy+=dy*dy;sxy+=dx*dy;}
+  sxx/=pts.length;syy/=pts.length;sxy/=pts.length;
+  const theta=0.5*Math.atan2(2*sxy,sxx-syy);      // principal axis angle
+  const ax=Math.cos(theta), ay=Math.sin(theta);   // along-wound
+  const nx=-ay, ny=ax;                             // across-wound
+
+  // project points onto (along, across); measure spread & symmetry
+  let along=[], across=[];
+  for(const [x,y] of pts){
+    const dx=x-mx,dy=y-my;
+    along.push(dx*ax+dy*ay);
+    across.push(dx*nx+dy*ny);
+  }
+  // cross-axis symmetry: stitches should straddle the wound evenly
+  let pos=0,neg=0; for(const a of across){ if(a>0)pos++; else neg++; }
+  const symmetry=1 - Math.abs(pos-neg)/pts.length;          // 1 = perfectly balanced
+
+  // stitch spacing regularity: histogram density along the wound, look for
+  // evenly spaced peaks → low coefficient of variation of gaps between peaks.
+  const minA=Math.min(...along), maxA=Math.max(...along);
+  const bins=48, hist=new Float32Array(bins);
+  const span=(maxA-minA)||1;
+  for(const a of along){ const b=Math.min(bins-1,Math.floor((a-minA)/span*bins)); hist[b]++; }
+  // smooth
+  const sm=new Float32Array(bins);
+  for(let b=0;b<bins;b++){let s=0,n=0;for(let k=-1;k<=1;k++){const j=b+k;if(j>=0&&j<bins){s+=hist[j];n++;}}sm[b]=s/n;}
+  const hmax=Math.max(...sm)||1;
+  const peaks=[];
+  for(let b=1;b<bins-1;b++){ if(sm[b]>sm[b-1]&&sm[b]>=sm[b+1]&&sm[b]>0.35*hmax) peaks.push(b); }
+  let regularity=0.3;
+  if(peaks.length>=3){
+    const gaps=[]; for(let i=1;i<peaks.length;i++)gaps.push(peaks[i]-peaks[i-1]);
+    const gm=gaps.reduce((a,b)=>a+b,0)/gaps.length;
+    const gv=Math.sqrt(gaps.reduce((a,b)=>a+(b-gm)*(b-gm),0)/gaps.length);
+    const cv=gv/(gm||1);                                   // coefficient of variation
+    regularity=Math.max(0,Math.min(1,1-cv));               // even gaps → high
+  } else if(peaks.length===2){ regularity=0.55; }
+
+  // alignment: how tightly thread hugs the wound axis (low across-spread vs along-spread)
+  const stdAlong=Math.sqrt(along.reduce((a,b)=>a+b*b,0)/along.length);
+  const stdAcross=Math.sqrt(across.reduce((a,b)=>a+b*b,0)/across.length);
+  const alignment=Math.max(0,Math.min(1,1-(stdAcross/(stdAlong+1e-3))*0.9));
+
+  // coverage sanity: too little or too much dark = penalise
+  const covScore=Math.max(0,1-Math.abs(coverage-0.06)/0.12);
+
+  // weighted success probability
+  const prob=Math.max(0.02,Math.min(0.98,
+    0.34*regularity + 0.26*symmetry + 0.24*alignment + 0.16*covScore));
+
+  return {prob, metrics:{regularity,symmetry,alignment,coverage:covScore}};
+}
+function analyzerScore(canvas){ return analyze(canvas).prob; }
+
+/* --- Backend B: user's trained CNN via TF.js -------------------------------
+   Resizes to the model's OWN input size (auto-detected on load) and scales to
+   0–1, matching the ImageDataGenerator(rescale=1/255) used in training. */
+async function cnnScore(canvas){
+  const [h,w] = state.modelInput || [GRID,GRID];
+  const t = tf.tidy(()=>{
+    let x = tf.browser.fromPixels(canvas).toFloat();
+    x = x.resizeBilinear([h,w]).div(255).expandDims(0);
+    return state.model.predict(x);
+  });
+  const arr = await t.data(); t.dispose();
+  // single sigmoid → P(successful); 2-way softmax → index 1 = successful.
+  // Flip here if your training labels were reversed for this model.
+  return arr.length===1 ? arr[0] : arr[1];
+}
+
+async function scoreCanvas(canvas){
+  return state.modelMode==='cnn' ? await cnnScore(canvas) : analyzerScore(canvas);
+}
+
+/* ---------- Occlusion heatmap (model-agnostic, SHAP-style) ----------------- */
+async function occlusionMap(srcCanvas, baseProb){
+  const map = new Float32Array(OCC*OCC);
+  const step = GRID/OCC;
+  const work = document.createElement('canvas'); work.width=GRID; work.height=GRID;
+  const wctx = work.getContext('2d',{willReadFrequently:true});
+  // mean grey to occlude with
+  for(let gy=0; gy<OCC; gy++){
+    for(let gx=0; gx<OCC; gx++){
+      wctx.drawImage(srcCanvas,0,0);
+      wctx.fillStyle='rgb(128,128,128)';
+      wctx.fillRect(gx*step, gy*step, step, step);
+      const p = await scoreCanvas(work);
+      // drop in success-prob when hidden ⇒ that region supported "successful" (blue/helps)
+      map[gy*OCC+gx] = baseProb - p;
+      if((gy*OCC+gx)%20===0) await new Promise(r=>setTimeout(r)); // keep UI responsive
+    }
+  }
+  return map;
+}
+
+/* ---------- Rendering result ----------------------------------------------- */
+function drawGauge(prob){
+  const g=$('gauge'); const pct=Math.round(prob*100);
+  const c=50, r=40, circ=2*Math.PI*r, off=circ*(1-prob);
+  const col = prob>=0.5 ? 'var(--good)' : 'var(--bad)';
+  g.innerHTML=`
+    <circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="var(--line)" stroke-width="8"/>
+    <circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="${col}" stroke-width="8"
+      stroke-linecap="round" stroke-dasharray="${circ}" stroke-dashoffset="${off}"
+      transform="rotate(-90 ${c} ${c})"/>
+    <text x="50" y="49" text-anchor="middle" font-family="IBM Plex Mono,monospace"
+      font-size="22" font-weight="600" fill="var(--ink)">${pct}</text>
+    <text x="50" y="65" text-anchor="middle" font-family="Inter,sans-serif"
+      font-size="9" fill="var(--muted)">/ 100</text>`;
+}
+
+function renderHeat(srcCanvas, map){
+  const base=$('baseCanvas'), over=$('heatOverlay');
+  base.width=GRID; base.height=GRID; over.width=GRID; over.height=GRID;
+  base.getContext('2d').drawImage(srcCanvas,0,0);
+
+  const octx=over.getContext('2d');
+  octx.clearRect(0,0,GRID,GRID);
+  let amax=1e-4; for(const v of map) amax=Math.max(amax,Math.abs(v));
+  const step=GRID/OCC;
+  // bilinear-ish soft blocks
+  for(let gy=0; gy<OCC; gy++)for(let gx=0; gx<OCC; gx++){
+    const v=map[gy*OCC+gx]/amax;             // -1..1  (>0 helps success, <0 hurts)
+    const a=Math.min(0.6, Math.abs(v)*0.7);
+    // v>0 (hiding it lowered success ⇒ supportive) → blue/green ; v<0 → red
+    const col = v>=0 ? `rgba(46,158,107,${a})` : `rgba(217,99,75,${a})`;
+    octx.fillStyle=col;
+    octx.fillRect(gx*step, gy*step, step+0.6, step+0.6);
+  }
+  over.style.filter='blur(6px)';
+}
+
+function renderMetrics(m){
+  const rows=[
+    ['Spacing regularity', m.regularity],
+    ['Cross-line symmetry', m.symmetry],
+    ['Wound alignment', m.alignment],
+    ['Thread coverage', m.coverage],
+  ];
+  $('metrics').innerHTML = rows.map(([k,v])=>`
+    <div class="metric">
+      <div class="k">${k}</div>
+      <div class="v">${Math.round(v*100)}%</div>
+      <div class="track"><div class="fill" style="width:${Math.round(v*100)}%"></div></div>
+    </div>`).join('');
+}
+
+/* ---------- Grade action --------------------------------------------------- */
+$('gradeBtn').addEventListener('click', async ()=>{
+  if(!state.finalImg) return;
+  setStep('grade');
+  const btn=$('gradeBtn');
+  btn.disabled=true; btn.innerHTML='<span class="busy"></span>Scoring…';
+
+  const canvas = toCanvas(state.finalImg, GRID);
+
+  // metrics come from the analyzer regardless (interpretable), score from active backend
+  const a = analyze(canvas);
+  const prob = await scoreCanvas(canvas);
+  const heat = await occlusionMap(canvas, prob);
+
+  // paint
+  $('result').style.display='block';
+  const good = prob>=0.5;
+  const v=$('verdict'); v.className='verdict '+(good?'good':'bad');
+  $('verdictLabel').textContent = good ? 'Successful suture' : 'Needs rework';
+  $('verdictConf').textContent = `${(prob*100).toFixed(1)}% success · ${state.modelMode==='cnn'?'CNN':'geometry analyzer'}`;
+  drawGauge(prob);
+  renderHeat(canvas, heat);
+  renderMetrics(a.metrics);
+
+  const ms=state.timer.attemptMs||state.timer.elapsed;
+  $('durationNote').innerHTML = ms>0
+    ? `Attempt time <b>${(ms/1000).toFixed(1)}s</b> · start photo ${state.startImg?'captured':'not captured'}`
+    : `Timer not run · start photo ${state.startImg?'captured':'not captured'}`;
+
+  btn.disabled=false; btn.textContent='Grade suture';
+  $('result').scrollIntoView({behavior:'smooth',block:'start'});
+});
+
+/* ---------- Heatmap / photo toggle ----------------------------------------- */
+$('viewToggle').addEventListener('click',(e)=>{
+  const b=e.target.closest('button'); if(!b)return;
+  document.querySelectorAll('#viewToggle button').forEach(x=>x.classList.remove('on'));
+  b.classList.add('on');
+  $('heatOverlay').style.opacity = b.dataset.view==='heat' ? '1' : '0';
+});
+
+/* ---------- Model loading -------------------------------------------------- */
+$('loadModel').addEventListener('click', async ()=>{
+  const url=$('modelUrl').value.trim();
+  const msg=$('modelMsg');
+  if(!url){ msg.textContent='Paste a model.json URL first.'; return; }
+  if(typeof tf==='undefined'){ msg.textContent='TensorFlow.js is still loading — try again in a moment.'; return; }
+  msg.innerHTML='<span class="busy"></span>Loading model…';
+  try{
+    // try layers model first, then graph model
+    let m; try{ m=await tf.loadLayersModel(url); }catch(_){ m=await tf.loadGraphModel(url); }
+    state.model=m; state.modelMode='cnn';
+    // auto-detect input size: shape is [null, H, W, C]
+    let shp = (m.inputs && m.inputs[0] && m.inputs[0].shape) || [null,GRID,GRID,3];
+    const h = shp[1]||GRID, w = shp[2]||GRID;
+    state.modelInput=[h,w];
+    $('modelState').textContent=`CNN ${h}×${w}`;
+    msg.innerHTML=`Model ready (${h}×${w} input). Grading now uses your network.`;
+  }catch(err){
+    msg.textContent='Could not load that model: '+err.message+'. Still using the geometry analyzer.';
+  }
+});
+$('unloadModel').addEventListener('click', ()=>{
+  state.model=null; state.modelMode='analyzer'; state.modelInput=null;
+  $('modelState').textContent='geometry analyzer';
+  $('modelMsg').textContent='Switched back to the on-device analyzer.';
+});
+
+/* init */
+$('clock').innerHTML = fmt(0);
+</script>
+</body>
+</html>
